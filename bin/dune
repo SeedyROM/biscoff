@@ -1,0 +1,6 @@
+(executable
+ (public_name biscoff)
+ (name main)
+ (libraries biscoff)
+ (preprocess
+  (pps ppx_let ppx_jane)))

@@ -1,0 +1,5 @@
+(library
+ (name biscoff)
+ (libraries async websocket-async core core_unix.command_unix cohttp-async)
+ (preprocess
+  (pps ppx_jane ppx_let)))
