@@ -1,0 +1,3 @@
+- [ ] Allow broadcasting messages to all connected clients
+  - [ ] Have a map of connected clients and their corresponding channels
+  - [ ] Send data to everyone!
