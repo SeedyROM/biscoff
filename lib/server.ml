@@ -91,6 +91,7 @@ let check_request req =
 let handle_server_error server =
   match%bind server with
   | Error err when Poly.equal (Error.to_exn err) Exit -> Deferred.unit
+  | Error err when Poly.equal (Error.to_exn err) End_of_file -> Deferred.unit
   | Error err -> Error.raise err
   | Ok () -> Deferred.unit
 
@@ -100,7 +101,7 @@ let create_server app_to_ws ws_to_app reader writer =
   |> handle_server_error
 
 (** Create the appropriate pipes to talk to the websocket server *)
-let create_ws_pipes =
+let create_ws_pipes () =
   let app_to_ws, sender_write = Pipe.create () in
   let receiver_read, ws_to_app = Pipe.create () in
   (app_to_ws, ws_to_app, sender_write, receiver_read)
@@ -110,10 +111,12 @@ let handle_client server_context addr reader writer =
   (* Convert the address into a string *)
   let addr_str = Socket.Address.to_string addr in
   Log.debug "New connection from %s" addr_str;
+
   (* Make the pipes for ws communication *)
-  let app_to_ws, ws_to_app, sender_write, receiver_read = create_ws_pipes in
+  let app_to_ws, ws_to_app, sender_write, receiver_read = create_ws_pipes () in
   (* Add the client to the map *)
   ClientMap.add server_context.clients addr_str receiver_read sender_write;
+
   (* Connect the server and start the client loop *)
   let%bind () =
     Deferred.any
@@ -122,6 +125,7 @@ let handle_client server_context addr reader writer =
         client_loop server_context addr_str receiver_read sender_write;
       ]
   in
+
   (* Remove the client from the map *)
   ClientMap.remove server_context.clients addr_str;
   Deferred.unit
