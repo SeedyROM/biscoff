@@ -3,37 +3,44 @@ open Core
 open Websocket_async
 module Log = Log.Global
 
-type client_connection = {
-  addr : string;
-  reader : Frame.t Pipe.Reader.t;
-  writer : Frame.t Pipe.Writer.t;
-}
+module Connection = struct
+  type t = {
+    addr : string;
+    reader : Frame.t Pipe.Reader.t;
+    writer : Frame.t Pipe.Writer.t;
+  }
 
-type client_map = (string, client_connection) Hashtbl.t
+  let create addr reader writer = { addr; reader; writer }
+end
 
-module ClientMap = struct
-  let add clients addr reader writer =
+module Connections = struct
+  type t = { connections : (string, Connection.t) Hashtbl.t }
+
+  let create () = { connections = Hashtbl.create (module String) }
+
+  let add t addr reader writer =
     Log.debug "New connection from %s" addr;
-    Hashtbl.add_exn clients ~key:addr ~data:{ addr; reader; writer }
+    Hashtbl.add_exn t.connections ~key:addr
+      ~data:(Connection.create addr reader writer)
 
-  let remove clients addr =
+  let remove t addr =
     Log.debug "Connection closed by %s" addr;
-    Hashtbl.remove clients addr
+    Hashtbl.remove t.connections addr
 
-  let get clients addr = Hashtbl.find clients addr
-  let get_all clients = Hashtbl.data clients
+  let get t addr = Hashtbl.find t.connections addr
+  let get_all t = Hashtbl.data t.connections
 
-  let get_all_except clients addr =
-    Hashtbl.filteri clients ~f:(fun ~key ~data:_ -> not (String.equal key addr))
+  let get_all_except t addr =
+    Hashtbl.filteri t.connections ~f:(fun ~key ~data:_ ->
+        not (String.equal key addr))
     |> Hashtbl.data
 end
 
-type server_context = { clients : client_map }
+module Context = struct
+  type t = { clients : Connections.t; msg_router : Frame.t Router.t }
 
-module ServerContext = struct
-  type t = server_context
-
-  let create () = { clients = Hashtbl.create (module String) }
+  let create () =
+    { clients = Connections.create (); msg_router = Router.create () }
 end
 
 (** Create a websocket server *)
@@ -56,7 +63,7 @@ let parse_frame frame content opcode addr =
   (frame', closed)
 
 (** Client connection loop, parse incoming frames *)
-let client_loop server_context addr receiver_read _sender_write =
+let client_loop (ctx : Context.t) addr receiver_read _sender_write =
   let rec loop () =
     match%bind Pipe.read receiver_read with
     | `Eof ->
@@ -70,11 +77,10 @@ let client_loop server_context addr receiver_read _sender_write =
           match frame'.opcode with
           | Opcode.Text ->
               (* Send the frame to each client in the client_map *)
-              let clients =
-                ClientMap.get_all_except server_context.clients addr
-              in
-              Deferred.List.iter clients ~f:(fun client ->
-                  Pipe.write client.writer frame')
+              let message = Printf.sprintf "%s: %s" addr content in
+              let new_frame = Frame.create ~opcode:Text ~content:message () in
+              Router.broadcast ctx.msg_router ~path:"all" ~data:new_frame;
+              Deferred.unit
           | _ -> Deferred.unit
         in
 
@@ -107,37 +113,49 @@ let create_ws_pipes () =
   (app_to_ws, ws_to_app, sender_write, receiver_read)
 
 (** Handle a new connection *)
-let handle_client server_context addr reader writer =
+let handle_client (ctx : Context.t) addr reader writer =
   (* Convert the address into a string *)
   let addr_str = Socket.Address.to_string addr in
   Log.debug "New connection from %s" addr_str;
 
   (* Make the pipes for ws communication *)
   let app_to_ws, ws_to_app, sender_write, receiver_read = create_ws_pipes () in
+
   (* Add the client to the map *)
-  ClientMap.add server_context.clients addr_str receiver_read sender_write;
+  Connections.add ctx.clients addr_str receiver_read sender_write;
+
+  (* Subscribe to the "all" route *)
+  let _ =
+    Router.subscribe ctx.msg_router ~path:"all" ~id:addr_str
+      ~writer:sender_write
+  in
 
   (* Connect the server and start the client loop *)
   let%bind () =
     Deferred.any
       [
         create_server app_to_ws ws_to_app reader writer;
-        client_loop server_context addr_str receiver_read sender_write;
+        client_loop ctx addr_str receiver_read sender_write;
       ]
   in
 
+  (* Unsubscribe *)
+  let _ = Router.unsubscribe ctx.msg_router ~path:"all" ~id:addr_str in
+
   (* Remove the client from the map *)
-  ClientMap.remove server_context.clients addr_str;
+  Connections.remove ctx.clients addr_str;
   Deferred.unit
 
 (** Start the websocket server *)
 let start port =
   Log.info "Starting server on port %d" port;
-  let server_context = ServerContext.create () in
-  let%bind _server =
+  let ctx = Context.create () in
+  (* Add the "all" route to the router *)
+  let _ = Router.add_route ctx.msg_router ~path:"all" ~route_type:`Room in
+  let%bind server =
     Tcp.(
       Server.create ~on_handler_error:`Ignore
         (Where_to_listen.of_port port)
-        (handle_client server_context))
+        (handle_client ctx))
   in
-  Deferred.never ()
+  Tcp.Server.close_finished server
